@@ -1,0 +1,18 @@
+services:
+  api:
+    build:
+      context: ./apps/api
+    env_file:
+      - ./apps/api/.env
+    ports:
+      - "3000:3000"
+
+  web:
+    build:
+      context: ./apps/web
+    env_file:
+      - ./apps/web/.env
+    ports:
+      - "5173:5173"
+    depends_on:
+      - api

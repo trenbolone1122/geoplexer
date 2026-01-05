@@ -1,0 +1,26 @@
+# dependencies
+node_modules
+
+# build output
+dist
+build
+out
+
+# coverage
+coverage
+
+# env files
+.env
+.env.*
+
+# caches
+.cache
+*.tsbuildinfo
+
+# logs
+*.log
+
+# OS/IDE
+.DS_Store
+.idea
+.vscode

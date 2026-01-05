@@ -1,6 +1,6 @@
-# Plexplorer (Geoplexer)
+# Geoplexer
 
-Local-first, BYOK (bring your own keys) globe exploration app. No hosted backend, no bundled API keys.
+Globe exploration app powered by the Perplexity API, with local weather and nearby places recommendations. 
 
 ## Quick start (Docker)
 

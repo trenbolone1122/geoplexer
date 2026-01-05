@@ -12,6 +12,7 @@ coverage
 # env files
 .env
 .env.*
+!.env.example
 
 # caches
 .cache

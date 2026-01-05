@@ -2,7 +2,8 @@
 
 Globe exploration app powered by the Perplexity API, with local weather and nearby places recommendations. 
 
-![Geoplexer screenshot](assets/screenshot.png)
+<img src="assets/screenshot.png" width="1100" alt="Geoplexer screenshot" />
+
 
 ## Quick start (Docker)
 

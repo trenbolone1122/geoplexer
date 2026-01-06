@@ -51,7 +51,6 @@ type SidebarMode = "details" | "bookmarks" | "history";
 
 const BOOKMARKS_STORAGE_KEY = "geoplexer.bookmarks";
 const HISTORY_STORAGE_KEY = "geoplexer.history";
-const PLACES_PILLS_BY_PLACE_STORAGE_KEY = "geoplexer.placesPillsUsedByPlace";
 const PLACE_CACHE_RADIUS_METERS = 1000;
 const PLACE_NAME_RADIUS_METERS = 10_000;
 const HISTORY_LIMIT = 40;
@@ -110,18 +109,14 @@ const normalizePlaceKey = (value) =>
     ? value.trim().toLowerCase().replace(/\s+/g, " ")
     : "";
 
+const normalizeGroupKey = (value) =>
+  typeof value === "string"
+    ? value.trim().toLowerCase().replace(/\s+/g, " ")
+    : "";
+
 const getPlaceNameKey = (place) => {
   if (!place || typeof place !== "object") return "";
   return normalizePlaceKey(place.title) || normalizePlaceKey(place.id) || "";
-};
-
-const parsePlaceId = (value) => {
-  if (typeof value !== "string") return null;
-  const [latRaw, lngRaw] = value.split(",");
-  const lat = Number(latRaw);
-  const lng = Number(lngRaw);
-  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
-  return { lat, lng };
 };
 
 const distanceMeters = (a, b) => {
@@ -179,28 +174,6 @@ const dedupePlaces = (places) => {
     next.push(place);
   });
   return next;
-};
-
-const loadStoredIdList = (key) => {
-  if (typeof window === "undefined") return [];
-  try {
-    const raw = window.localStorage.getItem(key);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return parsed.filter((item) => typeof item === "string");
-  } catch {
-    return [];
-  }
-};
-
-const saveStoredIdList = (key, value) => {
-  if (typeof window === "undefined") return;
-  try {
-    window.localStorage.setItem(key, JSON.stringify(value));
-  } catch {
-    // Ignore storage failures.
-  }
 };
 
 const joinLabel = (parts) => parts.filter(Boolean).join(", ");
@@ -552,11 +525,7 @@ export default function App() {
   const [placesStatus, setPlacesStatus] = useState("idle");
   const [placesError, setPlacesError] = useState("");
   const [selectedInterests, setSelectedInterests] = useState([]);
-  const [showExplorePills, setShowExplorePills] = useState(false);
-  const [showMorePlacesButton, setShowMorePlacesButton] = useState(true);
-  const [placesPillsUsed, setPlacesPillsUsed] = useState(() =>
-    loadStoredIdList(PLACES_PILLS_BY_PLACE_STORAGE_KEY),
-  );
+  const [exploreModalOpen, setExploreModalOpen] = useState(false);
   const [exploreOpen, setExploreOpen] = useState(true);
   const [placesScrollState, setPlacesScrollState] = useState({});
   const [summaryOpen, setSummaryOpen] = useState(true);
@@ -631,10 +600,6 @@ export default function App() {
     historyRef.current = history;
   }, [history]);
 
-  useEffect(() => {
-    saveStoredIdList(PLACES_PILLS_BY_PLACE_STORAGE_KEY, placesPillsUsed);
-  }, [placesPillsUsed]);
-
   const findCachedPlace = useCallback((lat, lng) => {
     const needle = { lat, lng };
     const matchKey = (item) => isSamePlaceForCache(item, needle);
@@ -681,8 +646,7 @@ export default function App() {
     setPlacesStatus("idle");
     setPlacesError("");
     setSelectedInterests([]);
-    setShowExplorePills(false);
-    setShowMorePlacesButton(true);
+    setExploreModalOpen(false);
     setExploreOpen(true);
     setPlacesScrollState({});
     setSummaryOpen(true);
@@ -771,21 +735,6 @@ export default function App() {
           setPlacesError("");
           setPlacesStatus("ready");
         }
-        if (!append && hasDefault) {
-          const defaultGroup = nextGroups.find(
-            (group) => group.id === DEFAULT_INTEREST.id,
-          );
-          const defaultEmpty =
-            !defaultGroup ||
-            !Array.isArray(defaultGroup.places) ||
-            defaultGroup.places.length === 0;
-          if (defaultEmpty) {
-            setShowExplorePills(false);
-            setShowMorePlacesButton(false);
-          } else {
-            setShowMorePlacesButton(true);
-          }
-        }
       } catch (err) {
         if (requestId !== placesRequestIdRef.current) return;
         if (isAbortError(err)) return;
@@ -829,15 +778,28 @@ export default function App() {
     return "Open ocean";
   }, [coords, geoStatus, placeName]);
 
-  const currentPlaceId = useMemo(() => {
-    if (!coords) return "";
-    return buildPlaceId(coords.lat, coords.lng);
-  }, [coords]);
-
-  const currentPlaceKey = useMemo(() => {
-    if (!coords) return "";
-    return buildPlaceId(coords.lat, coords.lng);
-  }, [coords]);
+  const optionalInterestsForModal = useMemo(() => {
+    const keys = new Set();
+    placesGroups.forEach((group) => {
+      if (!group || typeof group !== "object") return;
+      if (group.id) keys.add(normalizeGroupKey(group.id));
+      if (group.label) keys.add(normalizeGroupKey(group.label));
+      if (group.query) keys.add(normalizeGroupKey(group.query));
+      if (group.name) keys.add(normalizeGroupKey(group.name));
+      if (group.title) keys.add(normalizeGroupKey(group.title));
+      if (group.category) keys.add(normalizeGroupKey(group.category));
+    });
+    return OPTIONAL_INTERESTS.filter((interest) => {
+      const idKey = normalizeGroupKey(interest.id);
+      const labelKey = normalizeGroupKey(interest.label);
+      const queryKey = normalizeGroupKey(interest.query);
+      return (
+        !keys.has(idKey) &&
+        !keys.has(labelKey) &&
+        !keys.has(queryKey)
+      );
+    });
+  }, [placesGroups]);
 
   const toggleInterest = useCallback((interestId) => {
     placesRequestIdRef.current += 1;
@@ -849,38 +811,6 @@ export default function App() {
     });
     setPlacesError("");
   }, []);
-
-  const handleFetchPlaces = useCallback(() => {
-    if (!coords || selectedInterests.length === 0) return;
-    if (isCachedView) {
-      setIsCachedView(false);
-    }
-    const placeId = currentPlaceKey || buildPlaceId(coords.lat, coords.lng);
-    setPlacesPillsUsed((prev) =>
-      [placeId, ...prev.filter((key) => {
-        const point = parsePlaceId(key);
-        if (!point) return true;
-        return distanceMeters(point, coords) > PLACE_CACHE_RADIUS_METERS;
-      })],
-    );
-    const selections = OPTIONAL_INTERESTS.filter((interest) =>
-      selectedInterests.includes(interest.id),
-    );
-    const interests = selections.map(({ id, label, query }) => ({
-      id,
-      label,
-      query,
-    }));
-    setShowExplorePills(false);
-    setShowMorePlacesButton(false);
-    runPlacesSearch({ lat: coords.lat, lng: coords.lng, interests, append: true });
-  }, [
-    coords,
-    currentPlaceKey,
-    isCachedView,
-    runPlacesSearch,
-    selectedInterests,
-  ]);
 
   useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
@@ -1046,8 +976,7 @@ export default function App() {
       setPlacesStatus("idle");
       setPlacesError("");
       setSelectedInterests([]);
-      setShowExplorePills(false);
-      setShowMorePlacesButton(true);
+      setExploreModalOpen(false);
       setExploreOpen(true);
       setPlacesScrollState({});
       setSummaryOpen(true);
@@ -1082,8 +1011,7 @@ export default function App() {
             },
           ],
         });
-        setShowMorePlacesButton(true);
-        setShowExplorePills(false);
+        setExploreModalOpen(false);
       }
 
       const weatherPromise = fetch(`${apiBaseUrl}/weather`, {
@@ -1227,15 +1155,6 @@ export default function App() {
     if (!coords) return false;
     return bookmarks.some((item) => isSamePlaceForLists(item, coords));
   }, [bookmarks, coords]);
-
-  const pillsUsedForCurrentPlace = useMemo(() => {
-    if (!coords) return false;
-    return placesPillsUsed.some((key) => {
-      const point = parsePlaceId(key);
-      if (!point) return false;
-      return distanceMeters(point, coords) <= PLACE_CACHE_RADIUS_METERS;
-    });
-  }, [coords, placesPillsUsed]);
 
   const weatherKind = useMemo(() => {
     const code = weather?.current?.weather_code;
@@ -1501,8 +1420,7 @@ export default function App() {
       );
       setPlacesError(place.placesError || "");
       setSelectedInterests([]);
-      setShowExplorePills(false);
-      setShowMorePlacesButton(true);
+      setExploreModalOpen(false);
       setExploreOpen(true);
       setPlacesScrollState({});
       setSummaryOpen(true);
@@ -1518,30 +1436,13 @@ export default function App() {
         place.weatherStatus || (place.weather ? "ready" : "idle"),
       );
       setWeatherError(place.weatherError || "");
-      if (
-        place &&
-        Array.isArray(place.placesGroups) &&
-        place.placesGroups.some(
-          (group) => group?.id && group.id !== DEFAULT_INTEREST.id,
-        )
-      ) {
-        const placeId =
-          typeof place.lat === "number" && typeof place.lng === "number"
-            ? buildPlaceId(place.lat, place.lng)
-            : "";
-        if (placeId) {
-          const coords = { lat: place.lat, lng: place.lng };
-          setPlacesPillsUsed((prev) =>
-            [placeId, ...prev.filter((key) => {
-              const point = parsePlaceId(key);
-              if (!point) return true;
-              return distanceMeters(point, coords) > PLACE_CACHE_RADIUS_METERS;
-            })],
-          );
-        }
-      }
       setHistory((prev) => {
-        const nextEntry = { ...place, savedAt: Date.now() };
+        const existing = prev.find((item) => isSamePlaceForLists(item, place));
+        const nextEntry = {
+          ...(existing || {}),
+          ...place,
+          savedAt: Date.now(),
+        };
         const next = [
           nextEntry,
           ...prev.filter((item) => !isSamePlaceForLists(item, nextEntry)),
@@ -1567,14 +1468,15 @@ export default function App() {
   const handleBookmarkToggle = useCallback(() => {
     const entry = buildSavedPlace();
     if (!entry) return;
+    const nextEntry = { ...entry };
     setBookmarks((prev) => {
-      const exists = prev.some((item) => isSamePlaceForLists(item, entry));
+      const exists = prev.some((item) => isSamePlaceForLists(item, nextEntry));
       if (exists) {
-        return prev.filter((item) => !isSamePlaceForLists(item, entry));
+        return prev.filter((item) => !isSamePlaceForLists(item, nextEntry));
       }
       return [
-        entry,
-        ...prev.filter((item) => !isSamePlaceForLists(item, entry)),
+        nextEntry,
+        ...prev.filter((item) => !isSamePlaceForLists(item, nextEntry)),
       ];
     });
   }, [buildSavedPlace]);
@@ -1599,8 +1501,13 @@ export default function App() {
   const updateHistoryEntry = useCallback((entry) => {
     if (!entry) return;
     setHistory((prev) => {
+      const existing = prev.find((item) => isSamePlaceForLists(item, entry));
+      const merged = {
+        ...(existing || {}),
+        ...entry,
+      };
       const next = [
-        entry,
+        merged,
         ...prev.filter((item) => !isSamePlaceForLists(item, entry)),
       ];
       return next.slice(0, HISTORY_LIMIT);
@@ -1614,12 +1521,40 @@ export default function App() {
       const next = prev.map((item) => {
         if (isSamePlaceForLists(item, entry)) {
           updated = true;
-          return { ...item, ...entry, savedAt: item.savedAt };
+          return {
+            ...item,
+            ...entry,
+            savedAt: item.savedAt,
+          };
         }
         return item;
       });
       return updated ? next : prev;
     });
+  }, []);
+
+  const handleFetchPlaces = useCallback(() => {
+    if (!coords || selectedInterests.length === 0) return;
+    if (isCachedView) {
+      setIsCachedView(false);
+    }
+    const selections = OPTIONAL_INTERESTS.filter((interest) =>
+      selectedInterests.includes(interest.id),
+    );
+    const interests = selections.map(({ id, label, query }) => ({
+      id,
+      label,
+      query,
+    }));
+    setExploreModalOpen(false);
+    runPlacesSearch({ lat: coords.lat, lng: coords.lng, interests, append: true });
+  }, [coords, isCachedView, runPlacesSearch, selectedInterests]);
+
+  const handleResetExplore = useCallback(() => {
+    setSelectedInterests([]);
+    setExploreModalOpen(true);
+    setPlacesError("");
+    setPlacesScrollState({});
   }, []);
 
   const handleRefreshWeather = useCallback(async () => {
@@ -1943,7 +1878,7 @@ export default function App() {
     const showSummaryBlock = isMobile || aiStatus !== "loading";
     const showPlacesLoadingSkeletons =
       placesStatus === "loading" &&
-      (placesHasResults || showExplorePills || selectedInterests.length > 0);
+      (placesHasResults || selectedInterests.length > 0);
     const showPlacesBlock =
       !isMobile &&
       (placesHasResults ||
@@ -1951,11 +1886,7 @@ export default function App() {
         placesStatus === "error" ||
         showPlacesLoadingSkeletons);
     const showEmptyPlacesState = placesEmpty;
-    const showEmptyPlacesCta =
-      showEmptyPlacesState && !showExplorePills && !pillsUsedForCurrentPlace;
     const showPlacesErrorState = placesErrorEmpty;
-    const showPlacesErrorCta =
-      showPlacesErrorState && !showExplorePills && !pillsUsedForCurrentPlace;
 
     const imagesBlock =
       images.length > 0 ? (
@@ -2147,33 +2078,11 @@ export default function App() {
                 <div className="text-destructive">
                   {placesError || "Places request failed."}
                 </div>
-                {showPlacesErrorCta && (
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="outline"
-                    className="h-8 px-3 text-xs"
-                    onClick={() => setShowExplorePills(true)}
-                  >
-                    Search more categories
-                  </Button>
-                )}
               </div>
             )}
             {showEmptyPlacesState && (
               <div className="space-y-2 text-xs text-muted-foreground">
                 <div>No major tourist spots found.</div>
-                {showEmptyPlacesCta && (
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="outline"
-                    className="h-8 px-3 text-xs"
-                    onClick={() => setShowExplorePills(true)}
-                  >
-                    Search more categories
-                  </Button>
-                )}
               </div>
             )}
             {placesHasResults && (
@@ -2398,66 +2307,17 @@ export default function App() {
                 ))}
               </div>
             )}
-            {showMorePlacesButton &&
-              !showExplorePills &&
-              !showEmptyPlacesState &&
-              !pillsUsedForCurrentPlace && (
-              <div className="flex items-center gap-3">
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="outline"
-                  className="h-8 px-3 text-xs"
-                  onClick={() => setShowExplorePills(true)}
-                >
-                  Search for more places
-                </Button>
-                <span className="text-xs text-muted-foreground">
-                  Add optional categories below.
-                </span>
-              </div>
-            )}
-            {showExplorePills && !pillsUsedForCurrentPlace && (
-              <div className="space-y-2">
-                <div className="flex flex-wrap gap-2">
-                  {OPTIONAL_INTERESTS.map((interest) => {
-                    const isActive = selectedInterests.includes(interest.id);
-                    return (
-                      <button
-                        key={interest.id}
-                        type="button"
-                        onClick={() => toggleInterest(interest.id)}
-                        aria-pressed={isActive}
-                        className={`rounded-full border px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.2em] transition ${
-                          isActive
-                            ? "border-foreground bg-foreground text-background"
-                            : "border-border text-foreground/80 hover:bg-muted/40"
-                        }`}
-                      >
-                        {interest.label}
-                      </button>
-                    );
-                  })}
-                </div>
-                <div className="flex flex-wrap items-center gap-3">
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="outline"
-                    className="h-8 px-3 text-xs"
-                    onClick={handleFetchPlaces}
-                    disabled={!coords || selectedInterests.length === 0 || placesStatus === "loading"}
-                  >
-                    {placesStatus === "loading" ? "Searching..." : "Find places"}
-                  </Button>
-                  <span className="text-xs text-muted-foreground">
-                    {selectedInterests.length
-                      ? `${selectedInterests.length} selected`
-                      : "Select interests to search."}
-                  </span>
-                </div>
-              </div>
-            )}
+            <div className="flex items-center gap-2">
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                className="h-8 px-3 text-xs"
+                onClick={handleResetExplore}
+              >
+                Refine places
+              </Button>
+            </div>
           </>
         )}
       </div>
@@ -2723,6 +2583,70 @@ export default function App() {
               </div>
               <div className="max-h-[86vh] overflow-y-auto overflow-x-hidden -mr-8 pr-0">
                 <div className="pr-4">{expandedDetails}</div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {exploreModalOpen && !isMobile && (
+          <div
+            className="fixed inset-0 z-40 flex items-center justify-center bg-foreground/30 p-6 backdrop-blur-sm"
+            onClick={() => setExploreModalOpen(false)}
+          >
+            <div
+              className="w-full max-w-xl rounded-lg border border-border bg-sidebar/95 p-6 shadow-xl"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="flex items-center justify-between gap-3">
+                <div className="text-sm font-semibold uppercase tracking-[0.25em] text-foreground">
+                  Search more places
+                </div>
+                <Button
+                  type="button"
+                  size="icon-sm"
+                  variant="ghost"
+                  className="h-8 w-8"
+                  onClick={() => setExploreModalOpen(false)}
+                  aria-label="Close search modal"
+                >
+                  <X className="h-4 w-4" />
+                </Button>
+              </div>
+              <div className="mt-4 flex flex-wrap gap-2">
+                {optionalInterestsForModal.map((interest) => {
+                  const isActive = selectedInterests.includes(interest.id);
+                  return (
+                    <button
+                      key={interest.id}
+                      type="button"
+                      onClick={() => toggleInterest(interest.id)}
+                      aria-pressed={isActive}
+                      className={`rounded-full border px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.2em] transition ${
+                        isActive
+                          ? "border-foreground bg-foreground text-background"
+                          : "border-border text-foreground/80 hover:bg-muted/40"
+                      }`}
+                    >
+                      {interest.label}
+                    </button>
+                  );
+                })}
+              </div>
+              <div className="mt-4 flex flex-wrap items-center gap-3">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  className="h-8 px-3 text-xs"
+                  onClick={handleFetchPlaces}
+                  disabled={
+                    !coords ||
+                    selectedInterests.length === 0 ||
+                    placesStatus === "loading"
+                  }
+                >
+                  {placesStatus === "loading" ? "Searching..." : "Find places"}
+                </Button>
               </div>
             </div>
           </div>

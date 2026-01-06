@@ -52,6 +52,8 @@ type SidebarMode = "details" | "bookmarks" | "history";
 const BOOKMARKS_STORAGE_KEY = "geoplexer.bookmarks";
 const HISTORY_STORAGE_KEY = "geoplexer.history";
 const PLACES_PILLS_BY_PLACE_STORAGE_KEY = "geoplexer.placesPillsUsedByPlace";
+const PLACE_CACHE_RADIUS_METERS = 1000;
+const PLACE_NAME_RADIUS_METERS = 10_000;
 const HISTORY_LIMIT = 40;
 const SUMMARY_SNIPPET_LENGTH = 220;
 
@@ -101,6 +103,82 @@ const saveStoredPlaces = (key, value) => {
   } catch {
     // Ignore storage failures.
   }
+};
+
+const normalizePlaceKey = (value) =>
+  typeof value === "string"
+    ? value.trim().toLowerCase().replace(/\s+/g, " ")
+    : "";
+
+const getPlaceNameKey = (place) => {
+  if (!place || typeof place !== "object") return "";
+  return normalizePlaceKey(place.title) || normalizePlaceKey(place.id) || "";
+};
+
+const parsePlaceId = (value) => {
+  if (typeof value !== "string") return null;
+  const [latRaw, lngRaw] = value.split(",");
+  const lat = Number(latRaw);
+  const lng = Number(lngRaw);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  return { lat, lng };
+};
+
+const distanceMeters = (a, b) => {
+  if (!a || !b) return Infinity;
+  const lat1 = a.lat;
+  const lng1 = a.lng;
+  const lat2 = b.lat;
+  const lng2 = b.lng;
+  if (
+    !Number.isFinite(lat1) ||
+    !Number.isFinite(lng1) ||
+    !Number.isFinite(lat2) ||
+    !Number.isFinite(lng2)
+  ) {
+    return Infinity;
+  }
+  const toRad = (value) => (value * Math.PI) / 180;
+  const radius = 6_371_000;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const latRad1 = toRad(lat1);
+  const latRad2 = toRad(lat2);
+  const sinLat = Math.sin(dLat / 2);
+  const sinLng = Math.sin(dLng / 2);
+  const h =
+    sinLat * sinLat + Math.cos(latRad1) * Math.cos(latRad2) * sinLng * sinLng;
+  return 2 * radius * Math.asin(Math.sqrt(h));
+};
+
+const isSamePlaceByRadius = (a, b, radius = PLACE_CACHE_RADIUS_METERS) => {
+  const distance = distanceMeters(a, b);
+  return Number.isFinite(distance) && distance <= radius;
+};
+
+const isSamePlaceByName = (a, b) => {
+  const keyA = getPlaceNameKey(a);
+  const keyB = getPlaceNameKey(b);
+  return Boolean(keyA && keyB && keyA === keyB);
+};
+
+const isSamePlaceForLists = (a, b) =>
+  isSamePlaceByRadius(a, b) ||
+  (isSamePlaceByName(a, b) &&
+    isSamePlaceByRadius(a, b, PLACE_NAME_RADIUS_METERS));
+
+const isSamePlaceForCache = (a, b) => isSamePlaceByRadius(a, b);
+
+const dedupePlaces = (places) => {
+  const next = [];
+  places.forEach((place) => {
+    const hasDuplicate = next.some((existing) =>
+      isSamePlaceForLists(existing, place),
+    );
+    if (hasDuplicate) return;
+    next.push(place);
+  });
+  return next;
 };
 
 const loadStoredIdList = (key) => {
@@ -462,6 +540,8 @@ export default function App() {
   const geoAbortRef = useRef(null);
   const placesAbortRef = useRef(null);
   const expandedGalleryRef = useRef(null);
+  const bookmarksRef = useRef<SavedPlace[]>([]);
+  const historyRef = useRef<SavedPlace[]>([]);
 
   const [status, setStatus] = useState("idle");
   const [coords, setCoords] = useState(null);
@@ -491,10 +571,10 @@ export default function App() {
   const [sidebarMode, setSidebarMode] = useState<SidebarMode>("details");
   const [isCachedView, setIsCachedView] = useState(false);
   const [bookmarks, setBookmarks] = useState<SavedPlace[]>(() =>
-    loadStoredPlaces(BOOKMARKS_STORAGE_KEY),
+    dedupePlaces(loadStoredPlaces(BOOKMARKS_STORAGE_KEY)),
   );
   const [history, setHistory] = useState<SavedPlace[]>(() =>
-    loadStoredPlaces(HISTORY_STORAGE_KEY),
+    dedupePlaces(loadStoredPlaces(HISTORY_STORAGE_KEY)),
   );
   const [weather, setWeather] = useState(null);
   const [weatherStatus, setWeatherStatus] = useState("idle");
@@ -524,8 +604,46 @@ export default function App() {
   }, [history]);
 
   useEffect(() => {
+    setBookmarks((prev) => {
+      const next = dedupePlaces(prev);
+      if (next.length === prev.length && next.every((item, idx) => item === prev[idx])) {
+        return prev;
+      }
+      return next;
+    });
+  }, [bookmarks]);
+
+  useEffect(() => {
+    setHistory((prev) => {
+      const next = dedupePlaces(prev);
+      if (next.length === prev.length && next.every((item, idx) => item === prev[idx])) {
+        return prev;
+      }
+      return next;
+    });
+  }, [history]);
+
+  useEffect(() => {
+    bookmarksRef.current = bookmarks;
+  }, [bookmarks]);
+
+  useEffect(() => {
+    historyRef.current = history;
+  }, [history]);
+
+  useEffect(() => {
     saveStoredIdList(PLACES_PILLS_BY_PLACE_STORAGE_KEY, placesPillsUsed);
   }, [placesPillsUsed]);
+
+  const findCachedPlace = useCallback((lat, lng) => {
+    const needle = { lat, lng };
+    const matchKey = (item) => isSamePlaceForCache(item, needle);
+    return (
+      bookmarksRef.current.find(matchKey) ||
+      historyRef.current.find(matchKey) ||
+      null
+    );
+  }, []);
 
   const abortRequests = useCallback(() => {
     if (aiAbortRef.current) {
@@ -704,6 +822,23 @@ export default function App() {
     setPlacesScrollState(next);
   }, []);
 
+  const displayPlaceName = useMemo(() => {
+    if (!coords) return "No selection";
+    if (geoStatus === "loading") return "Resolving place...";
+    if (placeName) return placeName;
+    return "Open ocean";
+  }, [coords, geoStatus, placeName]);
+
+  const currentPlaceId = useMemo(() => {
+    if (!coords) return "";
+    return buildPlaceId(coords.lat, coords.lng);
+  }, [coords]);
+
+  const currentPlaceKey = useMemo(() => {
+    if (!coords) return "";
+    return buildPlaceId(coords.lat, coords.lng);
+  }, [coords]);
+
   const toggleInterest = useCallback((interestId) => {
     placesRequestIdRef.current += 1;
     setSelectedInterests((prev) => {
@@ -720,9 +855,13 @@ export default function App() {
     if (isCachedView) {
       setIsCachedView(false);
     }
-    const placeId = buildPlaceId(coords.lat, coords.lng);
+    const placeId = currentPlaceKey || buildPlaceId(coords.lat, coords.lng);
     setPlacesPillsUsed((prev) =>
-      prev.includes(placeId) ? prev : [placeId, ...prev],
+      [placeId, ...prev.filter((key) => {
+        const point = parsePlaceId(key);
+        if (!point) return true;
+        return distanceMeters(point, coords) > PLACE_CACHE_RADIUS_METERS;
+      })],
     );
     const selections = OPTIONAL_INTERESTS.filter((interest) =>
       selectedInterests.includes(interest.id),
@@ -735,7 +874,13 @@ export default function App() {
     setShowExplorePills(false);
     setShowMorePlacesButton(false);
     runPlacesSearch({ lat: coords.lat, lng: coords.lng, interests, append: true });
-  }, [coords, isCachedView, runPlacesSearch, selectedInterests]);
+  }, [
+    coords,
+    currentPlaceKey,
+    isCachedView,
+    runPlacesSearch,
+    selectedInterests,
+  ]);
 
   useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
@@ -874,6 +1019,11 @@ export default function App() {
 
     const handleSelectLocation = (lng, lat) => {
       abortRequests();
+      const cached = findCachedPlace(lat, lng);
+      if (cached) {
+        applyCachedPlace(cached, { lng, lat });
+        return;
+      }
       setIsCachedView(false);
       setSidebarOpen(true);
       setSidebarMode("details");
@@ -1021,18 +1171,6 @@ export default function App() {
     isMobile,
   ]);
 
-  const displayPlaceName = useMemo(() => {
-    if (!coords) return "No selection";
-    if (geoStatus === "loading") return "Resolving place...";
-    if (placeName) return placeName;
-    return "Open ocean";
-  }, [coords, geoStatus, placeName]);
-
-  const currentPlaceId = useMemo(() => {
-    if (!coords) return "";
-    return buildPlaceId(coords.lat, coords.lng);
-  }, [coords]);
-
   const formatSourceLabel = (url) => {
     try {
       return new URL(url).hostname.replace(/^www\./, "");
@@ -1086,14 +1224,18 @@ export default function App() {
   ]);
 
   const isBookmarked = useMemo(() => {
-    if (!currentPlaceId) return false;
-    return bookmarks.some((item) => item.id === currentPlaceId);
-  }, [bookmarks, currentPlaceId]);
+    if (!coords) return false;
+    return bookmarks.some((item) => isSamePlaceForLists(item, coords));
+  }, [bookmarks, coords]);
 
   const pillsUsedForCurrentPlace = useMemo(() => {
-    if (!currentPlaceId) return false;
-    return placesPillsUsed.includes(currentPlaceId);
-  }, [currentPlaceId, placesPillsUsed]);
+    if (!coords) return false;
+    return placesPillsUsed.some((key) => {
+      const point = parsePlaceId(key);
+      if (!point) return false;
+      return distanceMeters(point, coords) <= PLACE_CACHE_RADIUS_METERS;
+    });
+  }, [coords, placesPillsUsed]);
 
   const weatherKind = useMemo(() => {
     const code = weather?.current?.weather_code;
@@ -1336,12 +1478,14 @@ export default function App() {
   }, []);
 
   const applyCachedPlace = useCallback(
-    (place) => {
+    (place, overrideCoords = null) => {
       setIsCachedView(true);
       setSidebarMode("details");
       setSidebarOpen(true);
       setStatus("ready");
-      setCoords({ lng: place.lng, lat: place.lat });
+      setCoords(
+        overrideCoords || { lng: place.lng, lat: place.lat },
+      );
       setGeoStatus("ready");
       setPlaceName(place.title || "Unknown location");
       setSummary(place.summary || "");
@@ -1375,22 +1519,40 @@ export default function App() {
       );
       setWeatherError(place.weatherError || "");
       if (
-        place?.id &&
+        place &&
         Array.isArray(place.placesGroups) &&
         place.placesGroups.some(
           (group) => group?.id && group.id !== DEFAULT_INTEREST.id,
         )
       ) {
-        setPlacesPillsUsed((prev) =>
-          prev.includes(place.id) ? prev : [place.id, ...prev],
-        );
+        const placeId =
+          typeof place.lat === "number" && typeof place.lng === "number"
+            ? buildPlaceId(place.lat, place.lng)
+            : "";
+        if (placeId) {
+          const coords = { lat: place.lat, lng: place.lng };
+          setPlacesPillsUsed((prev) =>
+            [placeId, ...prev.filter((key) => {
+              const point = parsePlaceId(key);
+              if (!point) return true;
+              return distanceMeters(point, coords) > PLACE_CACHE_RADIUS_METERS;
+            })],
+          );
+        }
       }
       setHistory((prev) => {
         const nextEntry = { ...place, savedAt: Date.now() };
-        const next = [nextEntry, ...prev.filter((item) => item.id !== place.id)];
+        const next = [
+          nextEntry,
+          ...prev.filter((item) => !isSamePlaceForLists(item, nextEntry)),
+        ];
         return next.slice(0, HISTORY_LIMIT);
       });
-      focusMapAt(place.lng, place.lat);
+      if (overrideCoords) {
+        focusMapAt(overrideCoords.lng, overrideCoords.lat);
+      } else {
+        focusMapAt(place.lng, place.lat);
+      }
     },
     [focusMapAt],
   );
@@ -1406,11 +1568,14 @@ export default function App() {
     const entry = buildSavedPlace();
     if (!entry) return;
     setBookmarks((prev) => {
-      const exists = prev.some((item) => item.id === entry.id);
+      const exists = prev.some((item) => isSamePlaceForLists(item, entry));
       if (exists) {
-        return prev.filter((item) => item.id !== entry.id);
+        return prev.filter((item) => !isSamePlaceForLists(item, entry));
       }
-      return [entry, ...prev];
+      return [
+        entry,
+        ...prev.filter((item) => !isSamePlaceForLists(item, entry)),
+      ];
     });
   }, [buildSavedPlace]);
 
@@ -1432,18 +1597,29 @@ export default function App() {
   }, []);
 
   const updateHistoryEntry = useCallback((entry) => {
+    if (!entry) return;
     setHistory((prev) => {
-      const next = [entry, ...prev.filter((item) => item.id !== entry.id)];
+      const next = [
+        entry,
+        ...prev.filter((item) => !isSamePlaceForLists(item, entry)),
+      ];
       return next.slice(0, HISTORY_LIMIT);
     });
   }, []);
 
   const updateBookmarkEntry = useCallback((entry) => {
-    setBookmarks((prev) =>
-      prev.map((item) =>
-        item.id === entry.id ? { ...item, ...entry, savedAt: item.savedAt } : item,
-      ),
-    );
+    if (!entry) return;
+    setBookmarks((prev) => {
+      let updated = false;
+      const next = prev.map((item) => {
+        if (isSamePlaceForLists(item, entry)) {
+          updated = true;
+          return { ...item, ...entry, savedAt: item.savedAt };
+        }
+        return item;
+      });
+      return updated ? next : prev;
+    });
   }, []);
 
   const handleRefreshWeather = useCallback(async () => {

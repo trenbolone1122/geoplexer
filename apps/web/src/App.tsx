@@ -2,13 +2,13 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { marked } from "marked";
 import DOMPurify from "dompurify";
 import {
+  Bookmark,
   ChevronLeft,
   ChevronRight,
   Check,
   Expand,
+  History,
   Loader2,
-  Plus,
-  Sparkles,
   Star,
   X,
 } from "lucide-react";
@@ -26,6 +26,71 @@ import {
 import { useIsMobile } from "@/hooks/use-mobile";
 
 const formatCoord = (value) => value.toFixed(4);
+
+type SavedPlace = {
+  id: string;
+  title: string;
+  lat: number;
+  lng: number;
+  summary: string;
+  image?: string;
+  savedAt: number;
+};
+
+type SidebarMode = "details" | "bookmarks" | "history";
+
+const BOOKMARKS_STORAGE_KEY = "geoplexer.bookmarks";
+const HISTORY_STORAGE_KEY = "geoplexer.history";
+const HISTORY_LIMIT = 40;
+const SUMMARY_SNIPPET_LENGTH = 220;
+
+const buildPlaceId = (lat, lng) => `${lat.toFixed(4)},${lng.toFixed(4)}`;
+
+const truncateText = (value, maxLength) => {
+  if (!value) return "";
+  if (value.length <= maxLength) return value;
+  return `${value.slice(0, maxLength).trimEnd()}...`;
+};
+
+const stripCitationMarkers = (value) =>
+  value.replace(/\[\d+\]/g, "").replace(/\s{2,}/g, " ").trim();
+
+const stripMarkdown = (value) => {
+  if (!value) return "";
+  let output = value;
+  output = output.replace(/!\[[^\]]*]\([^)]*\)/g, "");
+  output = output.replace(/\[([^\]]+)\]\([^)]+\)/g, "$1");
+  output = output.replace(/`([^`]+)`/g, "$1");
+  output = output.replace(/\*\*(.*?)\*\*/g, "$1");
+  output = output.replace(/__(.*?)__/g, "$1");
+  output = output.replace(/\*(.*?)\*/g, "$1");
+  output = output.replace(/_(.*?)_/g, "$1");
+  output = output.replace(/~~(.*?)~~/g, "$1");
+  output = output.replace(/<[^>]+>/g, "");
+  return output.replace(/\s{2,}/g, " ").trim();
+};
+
+const loadStoredPlaces = (key) => {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = window.localStorage.getItem(key);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((item) => item && typeof item === "object");
+  } catch {
+    return [];
+  }
+};
+
+const saveStoredPlaces = (key, value) => {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    // Ignore storage failures.
+  }
+};
 
 const joinLabel = (parts) => parts.filter(Boolean).join(", ");
 
@@ -113,58 +178,98 @@ const formatRating = (value) => {
 const isAbortError = (error) =>
   error instanceof Error && error.name === "AbortError";
 
-function CollapsedSidebarControl({ onReset }) {
+function CollapsedSidebarControl({ showChevron, onShowBookmarks, onShowHistory }) {
   const { state, toggleSidebar } = useSidebar();
   if (state !== "collapsed") return null;
 
-  const handleNewSearch = () => {
-    onReset?.();
-    toggleSidebar();
-  };
-
   return (
     <div className="flex h-full flex-col items-center gap-2 px-2 py-4">
+      {showChevron && (
+        <Button
+          variant="ghost"
+          size="icon"
+          className="h-9 w-9"
+          onClick={toggleSidebar}
+          aria-label="Expand sidebar"
+        >
+          <ChevronRight className="h-4 w-4" />
+        </Button>
+      )}
       <Button
         variant="ghost"
         size="icon"
         className="h-9 w-9"
-        onClick={toggleSidebar}
-        aria-label="Expand sidebar"
+        onClick={onShowBookmarks}
+        aria-label="Bookmarks"
       >
-        <ChevronRight className="h-4 w-4" />
+        <Bookmark className="h-4 w-4" />
       </Button>
       <Button
         variant="ghost"
         size="icon"
         className="h-9 w-9"
-        onClick={handleNewSearch}
-        aria-label="New search"
+        onClick={onShowHistory}
+        aria-label="Recently visited"
       >
-        <Plus className="h-4 w-4" />
+        <History className="h-4 w-4" />
       </Button>
     </div>
   );
 }
 
-function ResetSearchButton({ onReset, className }) {
-  const { isMobile, resetMobileSheetHeight, setOpenMobile } = useSidebar();
-
+function SavedPlacesPanel({ title, items, emptyLabel, onSelect }) {
   return (
-    <Button
-      size="icon"
-      variant="ghost"
-      className={className}
-      onClick={() => {
-        if (isMobile) {
-          resetMobileSheetHeight();
-          setOpenMobile(true);
-        }
-        onReset?.();
-      }}
-      aria-label="New search"
-    >
-      <Plus className="h-4 w-4" />
-    </Button>
+    <div className="space-y-4">
+      <div className="text-xs font-semibold uppercase tracking-[0.25em] text-muted-foreground">
+        {title}
+      </div>
+      {items.length === 0 ? (
+        <div className="text-sm text-muted-foreground">{emptyLabel}</div>
+      ) : (
+        <div className="space-y-4">
+          {items.map((item) => {
+            const summaryText = truncateText(
+              stripCitationMarkers(stripMarkdown(item.summary || "")),
+              SUMMARY_SNIPPET_LENGTH,
+            );
+            return (
+              <button
+                key={item.id}
+                type="button"
+                className="flex w-full flex-col gap-3 rounded-lg border border-border bg-background/70 p-4 text-left shadow-sm transition hover:shadow-md"
+                onClick={() => onSelect?.(item)}
+              >
+                <div className="space-y-1">
+                  <div className="text-base font-semibold text-foreground">
+                    {item.title}
+                  </div>
+                  <div className="text-xs text-muted-foreground">
+                    {formatCoord(item.lat)}, {formatCoord(item.lng)}
+                  </div>
+                </div>
+                {item.image ? (
+                  <img
+                    src={item.image}
+                    alt={item.title}
+                    loading="lazy"
+                    className="h-40 w-full rounded-md object-cover"
+                  />
+                ) : (
+                  <div className="flex h-40 w-full items-center justify-center rounded-md border border-border/70 bg-muted/20 text-[11px] text-muted-foreground">
+                    No image
+                  </div>
+                )}
+                {summaryText ? (
+                  <p className="text-sm text-muted-foreground">
+                    {summaryText}
+                  </p>
+                ) : null}
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -226,38 +331,6 @@ function SidebarDetailsPanel({ render, ...rest }) {
     mobileCollapsed: isMobile && mobileSheetCollapsed,
     onMobileExpand: handleExpand,
   });
-}
-
-function MobileActionPill({ isMobile, coords, onRandom, onReset }) {
-  const { resetMobileSheetHeight } = useSidebar();
-  if (!isMobile) return null;
-
-  return (
-    <div className="fixed bottom-24 right-4 z-30 flex items-center gap-1 rounded-full border border-border bg-background/90 p-1 shadow-lg backdrop-blur md:hidden">
-      <Button
-        type="button"
-        variant="ghost"
-        size="icon-sm"
-        onClick={onRandom}
-        aria-label="Random location"
-      >
-        <Sparkles className="h-4 w-4" />
-      </Button>
-      <Button
-        type="button"
-        variant="ghost"
-        size="icon-sm"
-        onClick={() => {
-          resetMobileSheetHeight();
-          onReset?.();
-        }}
-        aria-label="New search"
-        disabled={!coords}
-      >
-        <Plus className="h-4 w-4" />
-      </Button>
-    </div>
-  );
 }
 
 function MobileLightboxCollapse({ isMobile, lightboxOpen, lightboxSource }) {
@@ -354,6 +427,14 @@ export default function App() {
   const [sidebarCarouselIndex, setSidebarCarouselIndex] = useState(0);
   const [expandedCarouselIndex, setExpandedCarouselIndex] = useState(0);
   const [expandedOpen, setExpandedOpen] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [sidebarMode, setSidebarMode] = useState<SidebarMode>("details");
+  const [bookmarks, setBookmarks] = useState<SavedPlace[]>(() =>
+    loadStoredPlaces(BOOKMARKS_STORAGE_KEY),
+  );
+  const [history, setHistory] = useState<SavedPlace[]>(() =>
+    loadStoredPlaces(HISTORY_STORAGE_KEY),
+  );
   const [weather, setWeather] = useState(null);
   const [weatherStatus, setWeatherStatus] = useState("idle");
   const [weatherError, setWeatherError] = useState("");
@@ -372,6 +453,15 @@ export default function App() {
   }, []);
   const selectLocationRef = useRef(null);
   const placesRowRefs = useRef({});
+  const lastStatusRef = useRef(status);
+
+  useEffect(() => {
+    saveStoredPlaces(BOOKMARKS_STORAGE_KEY, bookmarks);
+  }, [bookmarks]);
+
+  useEffect(() => {
+    saveStoredPlaces(HISTORY_STORAGE_KEY, history);
+  }, [history]);
 
   const abortRequests = useCallback(() => {
     if (aiAbortRef.current) {
@@ -668,6 +758,8 @@ export default function App() {
 
     const handleSelectLocation = (lng, lat) => {
       abortRequests();
+      setSidebarOpen(true);
+      setSidebarMode("details");
       const requestId = ++requestIdRef.current;
       const geoController = new AbortController();
       const weatherController = new AbortController();
@@ -819,6 +911,11 @@ export default function App() {
     return "Open ocean";
   }, [coords, geoStatus, placeName]);
 
+  const currentPlaceId = useMemo(() => {
+    if (!coords) return "";
+    return buildPlaceId(coords.lat, coords.lng);
+  }, [coords]);
+
   const formatSourceLabel = (url) => {
     try {
       return new URL(url).hostname.replace(/^www\./, "");
@@ -835,6 +932,25 @@ export default function App() {
       idx !== -1 ? summary.slice(idx + marker.length) : summary;
     return trimmed.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
   }, [summary]);
+
+  const buildSavedPlace = useCallback(() => {
+    if (!coords) return null;
+    const summaryText = cleanedSummary || summary || "Summary unavailable.";
+    return {
+      id: buildPlaceId(coords.lat, coords.lng),
+      title: displayPlaceName || "Unknown location",
+      lat: coords.lat,
+      lng: coords.lng,
+      summary: summaryText,
+      image: images[0],
+      savedAt: Date.now(),
+    };
+  }, [coords, cleanedSummary, summary, displayPlaceName, images]);
+
+  const isBookmarked = useMemo(() => {
+    if (!currentPlaceId) return false;
+    return bookmarks.some((item) => item.id === currentPlaceId);
+  }, [bookmarks, currentPlaceId]);
 
   const weatherKind = useMemo(() => {
     const code = weather?.current?.weather_code;
@@ -1064,67 +1180,51 @@ export default function App() {
     setExpandedCarouselIndex((prev) => (prev - 1 + images.length) % images.length);
   };
 
-  const handleResetSearch = () => {
-    abortRequests();
-    requestIdRef.current += 1;
-    setStatus("idle");
-    setCoords(null);
-    setSummary("");
-    setImages([]);
-    setSources([]);
-    setPlacesGroups([]);
-    setPlacesStatus("idle");
-    setPlacesError("");
-    setSelectedInterests([]);
-    setShowExplorePills(false);
-    setShowMorePlacesButton(true);
-    setExploreOpen(true);
-    setPlacesScrollState({});
-    setSummaryOpen(true);
-    setSourcesOpen(false);
-    setLightboxOpen(false);
-    setLightboxIndex(0);
-    setLightboxSource(null);
-    setSidebarCarouselIndex(0);
-    setExpandedCarouselIndex(0);
-    setExpandedOpen(false);
-    setPlaceName("");
-    setGeoStatus("idle");
-    setWeather(null);
-    setWeatherStatus("idle");
-    setWeatherError("");
-    setAiError("");
-    setError("");
-    placesRequestIdRef.current += 1;
-  };
+  const handleSelectSavedPlace = useCallback(
+    (place) => {
+      const selectLocation = selectLocationRef.current;
+      if (!selectLocation) return;
+      setSidebarMode("details");
+      setSidebarOpen(true);
+      selectLocation(place.lng, place.lat);
+    },
+    [setSidebarMode, setSidebarOpen],
+  );
 
-  const isLikelyOcean = (label) =>
-    /ocean|sea|gulf|bay|strait|channel|bight|sound/i.test(label) ||
-    label.toLowerCase().includes("open ocean");
+  const handleBookmarkToggle = useCallback(() => {
+    const entry = buildSavedPlace();
+    if (!entry) return;
+    setBookmarks((prev) => {
+      const exists = prev.some((item) => item.id === entry.id);
+      if (exists) {
+        return prev.filter((item) => item.id !== entry.id);
+      }
+      return [entry, ...prev];
+    });
+  }, [buildSavedPlace]);
 
-  const handleSurprise = async () => {
-    const selectLocation = selectLocationRef.current;
-    if (!selectLocation || !mapboxToken) return;
+  const handleOpenBookmarks = useCallback(() => {
+    setSidebarOpen(true);
+    setSidebarMode("bookmarks");
+  }, []);
 
-    let picked = null;
-    for (let attempt = 0; attempt < 8; attempt += 1) {
-      const lat = Math.random() * 120 - 55;
-      const lng = Math.random() * 360 - 180;
-      try {
-        const label = await reverseGeocode(lng, lat);
-        if (label && !isLikelyOcean(label)) {
-          picked = { lat, lng };
-          break;
-        }
-      } catch {
-        // Ignore and retry.
+  const handleOpenHistory = useCallback(() => {
+    setSidebarOpen(true);
+    setSidebarMode("history");
+  }, []);
+
+  useEffect(() => {
+    if (status === "ready" && lastStatusRef.current !== "ready") {
+      const entry = buildSavedPlace();
+      if (entry) {
+        setHistory((prev) => {
+          const next = [entry, ...prev.filter((item) => item.id !== entry.id)];
+          return next.slice(0, HISTORY_LIMIT);
+        });
       }
     }
-
-    const lat = picked?.lat ?? Math.random() * 120 - 55;
-    const lng = picked?.lng ?? Math.random() * 360 - 180;
-    selectLocation(lng, lat);
-  };
+    lastStatusRef.current = status;
+  }, [status, buildSavedPlace]);
 
   const weatherLabel = useMemo(() => {
     if (weatherStatus === "loading") return "Weather...";
@@ -1194,11 +1294,8 @@ export default function App() {
       }
       if (status === "idle") {
         return (
-          <div className="flex items-center justify-between gap-3 text-sm text-muted-foreground">
-            <span>Click anywhere on the globe.</span>
-            <Button size="sm" variant="outline" onClick={handleSurprise}>
-              Random location
-            </Button>
+          <div className="text-sm text-muted-foreground">
+            Click anywhere on the globe.
           </div>
         );
       }
@@ -1269,14 +1366,6 @@ export default function App() {
       return (
         <div className="space-y-3 text-sm text-muted-foreground">
           <p>Click anywhere on the globe.</p>
-          <Button
-            size="sm"
-            variant="outline"
-            className="h-8 px-3 text-xs"
-            onClick={handleSurprise}
-          >
-            Random location
-          </Button>
         </div>
       );
     }
@@ -1983,6 +2072,25 @@ export default function App() {
     />
   );
 
+  const sidebarBody =
+    sidebarMode === "details" ? (
+      sidebarDetails
+    ) : sidebarMode === "bookmarks" ? (
+      <SavedPlacesPanel
+        title="Bookmarks"
+        items={bookmarks}
+        emptyLabel="No bookmarks yet."
+        onSelect={handleSelectSavedPlace}
+      />
+    ) : (
+      <SavedPlacesPanel
+        title="Recently visited"
+        items={history}
+        emptyLabel="No places visited yet."
+        onSelect={handleSelectSavedPlace}
+      />
+    );
+
   const expandedDetails = renderDetails({
     variant: "expanded",
     carouselIndex: expandedCarouselIndex,
@@ -1996,7 +2104,8 @@ export default function App() {
     <div className="relative h-full w-full overflow-hidden">
       <div ref={mapContainerRef} className="absolute inset-0 z-0 h-full w-full" />
         <SidebarProvider
-          defaultOpen
+          open={sidebarOpen}
+          onOpenChange={setSidebarOpen}
           className="relative z-10 h-full w-full"
           style={{ "--sidebar-width": "30rem" }}
           mobileDisableExpand={status === "idle" || status === "loading"}
@@ -2024,11 +2133,22 @@ export default function App() {
                       <div className="flex items-center gap-2">
                         {coords && (
                           <>
-                            <ResetSearchButton
+                            <Button
+                              size="icon"
+                              variant="ghost"
                               className="h-8 w-8"
-                              onReset={handleResetSearch}
-                            />
-                            {!isMobile && (
+                              onClick={handleBookmarkToggle}
+                              aria-label="Bookmarks"
+                              title="Bookmarks"
+                            >
+                              <Bookmark
+                                className={`h-4 w-4 ${
+                                  isBookmarked ? "text-cyan-300" : "text-foreground"
+                                }`}
+                                fill={isBookmarked ? "currentColor" : "none"}
+                              />
+                            </Button>
+                            {!isMobile && sidebarMode === "details" && (
                               <Button
                                 size="icon"
                                 variant="ghost"
@@ -2052,9 +2172,13 @@ export default function App() {
                 </>
               </MobileSidebarHeader>
               <SidebarContent className="px-4 group-data-[state=collapsed]:hidden">
-                {sidebarDetails}
+                {sidebarBody}
               </SidebarContent>
-            <CollapsedSidebarControl onReset={handleResetSearch} />
+            <CollapsedSidebarControl
+              showChevron={status !== "idle"}
+              onShowBookmarks={handleOpenBookmarks}
+              onShowHistory={handleOpenHistory}
+            />
           </div>
         </Sidebar>
       )}
@@ -2131,12 +2255,6 @@ export default function App() {
           </div>
           </div>
         )}
-        <MobileActionPill
-          isMobile={isMobile}
-          coords={coords}
-          onRandom={handleSurprise}
-          onReset={handleResetSearch}
-        />
       </SidebarProvider>
     </div>
   );

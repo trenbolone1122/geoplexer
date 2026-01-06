@@ -3,6 +3,7 @@ import { marked } from "marked";
 import DOMPurify from "dompurify";
 import {
   Bookmark,
+  CircleStop,
   ChevronLeft,
   ChevronRight,
   Check,
@@ -50,7 +51,7 @@ type SidebarMode = "details" | "bookmarks" | "history";
 
 const BOOKMARKS_STORAGE_KEY = "geoplexer.bookmarks";
 const HISTORY_STORAGE_KEY = "geoplexer.history";
-const PLACES_PILLS_STORAGE_KEY = "geoplexer.placesPillsUsed";
+const PLACES_PILLS_BY_PLACE_STORAGE_KEY = "geoplexer.placesPillsUsedByPlace";
 const HISTORY_LIMIT = 40;
 const SUMMARY_SNIPPET_LENGTH = 220;
 
@@ -102,22 +103,23 @@ const saveStoredPlaces = (key, value) => {
   }
 };
 
-const loadStoredFlag = (key, fallback = false) => {
-  if (typeof window === "undefined") return fallback;
+const loadStoredIdList = (key) => {
+  if (typeof window === "undefined") return [];
   try {
     const raw = window.localStorage.getItem(key);
-    if (raw === null) return fallback;
+    if (!raw) return [];
     const parsed = JSON.parse(raw);
-    return typeof parsed === "boolean" ? parsed : fallback;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((item) => typeof item === "string");
   } catch {
-    return fallback;
+    return [];
   }
 };
 
-const saveStoredFlag = (key, value) => {
+const saveStoredIdList = (key, value) => {
   if (typeof window === "undefined") return;
   try {
-    window.localStorage.setItem(key, JSON.stringify(Boolean(value)));
+    window.localStorage.setItem(key, JSON.stringify(value));
   } catch {
     // Ignore storage failures.
   }
@@ -472,8 +474,8 @@ export default function App() {
   const [selectedInterests, setSelectedInterests] = useState([]);
   const [showExplorePills, setShowExplorePills] = useState(false);
   const [showMorePlacesButton, setShowMorePlacesButton] = useState(true);
-  const [hidePlacesPills, setHidePlacesPills] = useState(() =>
-    loadStoredFlag(PLACES_PILLS_STORAGE_KEY),
+  const [placesPillsUsed, setPlacesPillsUsed] = useState(() =>
+    loadStoredIdList(PLACES_PILLS_BY_PLACE_STORAGE_KEY),
   );
   const [exploreOpen, setExploreOpen] = useState(true);
   const [placesScrollState, setPlacesScrollState] = useState({});
@@ -522,11 +524,8 @@ export default function App() {
   }, [history]);
 
   useEffect(() => {
-    saveStoredFlag(PLACES_PILLS_STORAGE_KEY, hidePlacesPills);
-    if (hidePlacesPills) {
-      setShowExplorePills(false);
-    }
-  }, [hidePlacesPills]);
+    saveStoredIdList(PLACES_PILLS_BY_PLACE_STORAGE_KEY, placesPillsUsed);
+  }, [placesPillsUsed]);
 
   const abortRequests = useCallback(() => {
     if (aiAbortRef.current) {
@@ -546,6 +545,45 @@ export default function App() {
       placesAbortRef.current = null;
     }
   }, []);
+
+  const resetSelection = useCallback(() => {
+    requestIdRef.current += 1;
+    placesRequestIdRef.current += 1;
+    abortRequests();
+    setStatus("idle");
+    setIsCachedView(false);
+    setCoords(null);
+    setGeoStatus("idle");
+    setPlaceName("");
+    setSummary("");
+    setAiError("");
+    setImages([]);
+    setSources([]);
+    setPlacesGroups([]);
+    setPlacesStatus("idle");
+    setPlacesError("");
+    setSelectedInterests([]);
+    setShowExplorePills(false);
+    setShowMorePlacesButton(true);
+    setExploreOpen(true);
+    setPlacesScrollState({});
+    setSummaryOpen(true);
+    setSourcesOpen(false);
+    setLightboxOpen(false);
+    setLightboxIndex(0);
+    setLightboxSource(null);
+    setSidebarCarouselIndex(0);
+    setExpandedCarouselIndex(0);
+    setExpandedOpen(false);
+    setWeather(null);
+    setWeatherStatus("idle");
+    setWeatherError("");
+    setSidebarMode("details");
+    setSidebarOpen(false);
+    if (markerRef.current) {
+      markerRef.current.remove();
+    }
+  }, [abortRequests]);
 
   const runPlacesSearch = useCallback(
     async ({ lat, lng, interests, append = false }) => {
@@ -682,9 +720,10 @@ export default function App() {
     if (isCachedView) {
       setIsCachedView(false);
     }
-    if (!hidePlacesPills) {
-      setHidePlacesPills(true);
-    }
+    const placeId = buildPlaceId(coords.lat, coords.lng);
+    setPlacesPillsUsed((prev) =>
+      prev.includes(placeId) ? prev : [placeId, ...prev],
+    );
     const selections = OPTIONAL_INTERESTS.filter((interest) =>
       selectedInterests.includes(interest.id),
     );
@@ -696,13 +735,7 @@ export default function App() {
     setShowExplorePills(false);
     setShowMorePlacesButton(false);
     runPlacesSearch({ lat: coords.lat, lng: coords.lng, interests, append: true });
-  }, [
-    coords,
-    hidePlacesPills,
-    isCachedView,
-    runPlacesSearch,
-    selectedInterests,
-  ]);
+  }, [coords, isCachedView, runPlacesSearch, selectedInterests]);
 
   useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
@@ -1057,6 +1090,11 @@ export default function App() {
     return bookmarks.some((item) => item.id === currentPlaceId);
   }, [bookmarks, currentPlaceId]);
 
+  const pillsUsedForCurrentPlace = useMemo(() => {
+    if (!currentPlaceId) return false;
+    return placesPillsUsed.includes(currentPlaceId);
+  }, [currentPlaceId, placesPillsUsed]);
+
   const weatherKind = useMemo(() => {
     const code = weather?.current?.weather_code;
     if (typeof code !== "number") return "unknown";
@@ -1336,6 +1374,17 @@ export default function App() {
         place.weatherStatus || (place.weather ? "ready" : "idle"),
       );
       setWeatherError(place.weatherError || "");
+      if (
+        place?.id &&
+        Array.isArray(place.placesGroups) &&
+        place.placesGroups.some(
+          (group) => group?.id && group.id !== DEFAULT_INTEREST.id,
+        )
+      ) {
+        setPlacesPillsUsed((prev) =>
+          prev.includes(place.id) ? prev : [place.id, ...prev],
+        );
+      }
       setHistory((prev) => {
         const nextEntry = { ...place, savedAt: Date.now() };
         const next = [nextEntry, ...prev.filter((item) => item.id !== place.id)];
@@ -1727,10 +1776,10 @@ export default function App() {
         showPlacesLoadingSkeletons);
     const showEmptyPlacesState = placesEmpty;
     const showEmptyPlacesCta =
-      showEmptyPlacesState && !showExplorePills && !hidePlacesPills;
+      showEmptyPlacesState && !showExplorePills && !pillsUsedForCurrentPlace;
     const showPlacesErrorState = placesErrorEmpty;
     const showPlacesErrorCta =
-      showPlacesErrorState && !showExplorePills && !hidePlacesPills;
+      showPlacesErrorState && !showExplorePills && !pillsUsedForCurrentPlace;
 
     const imagesBlock =
       images.length > 0 ? (
@@ -2176,7 +2225,7 @@ export default function App() {
             {showMorePlacesButton &&
               !showExplorePills &&
               !showEmptyPlacesState &&
-              !hidePlacesPills && (
+              !pillsUsedForCurrentPlace && (
               <div className="flex items-center gap-3">
                 <Button
                   type="button"
@@ -2192,7 +2241,7 @@ export default function App() {
                 </span>
               </div>
             )}
-            {showExplorePills && !hidePlacesPills && (
+            {showExplorePills && !pillsUsedForCurrentPlace && (
               <div className="space-y-2">
                 <div className="flex flex-wrap gap-2">
                   {OPTIONAL_INTERESTS.map((interest) => {
@@ -2398,6 +2447,18 @@ export default function App() {
                       <div className="flex items-center gap-2">
                         {coords && sidebarMode === "details" && !isMobile && (
                           <>
+                            {status === "loading" && (
+                              <Button
+                                size="icon"
+                                variant="ghost"
+                                className="h-8 w-8"
+                                onClick={resetSelection}
+                                aria-label="Stop loading"
+                                title="Stop loading"
+                              >
+                                <CircleStop className="h-4 w-4" />
+                              </Button>
+                            )}
                             <Button
                               size="icon"
                               variant="ghost"

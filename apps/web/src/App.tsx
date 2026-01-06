@@ -9,6 +9,7 @@ import {
   Expand,
   History,
   Loader2,
+  RefreshCw,
   Star,
   X,
 } from "lucide-react";
@@ -33,6 +34,14 @@ type SavedPlace = {
   lat: number;
   lng: number;
   summary: string;
+  images: string[];
+  sources: string[];
+  placesGroups: unknown[];
+  placesError?: string;
+  placesStatus?: string;
+  weather?: unknown;
+  weatherStatus?: string;
+  weatherError?: string;
   image?: string;
   savedAt: number;
 };
@@ -41,6 +50,7 @@ type SidebarMode = "details" | "bookmarks" | "history";
 
 const BOOKMARKS_STORAGE_KEY = "geoplexer.bookmarks";
 const HISTORY_STORAGE_KEY = "geoplexer.history";
+const PLACES_PILLS_STORAGE_KEY = "geoplexer.placesPillsUsed";
 const HISTORY_LIMIT = 40;
 const SUMMARY_SNIPPET_LENGTH = 220;
 
@@ -87,6 +97,27 @@ const saveStoredPlaces = (key, value) => {
   if (typeof window === "undefined") return;
   try {
     window.localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    // Ignore storage failures.
+  }
+};
+
+const loadStoredFlag = (key, fallback = false) => {
+  if (typeof window === "undefined") return fallback;
+  try {
+    const raw = window.localStorage.getItem(key);
+    if (raw === null) return fallback;
+    const parsed = JSON.parse(raw);
+    return typeof parsed === "boolean" ? parsed : fallback;
+  } catch {
+    return fallback;
+  }
+};
+
+const saveStoredFlag = (key, value) => {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(key, JSON.stringify(Boolean(value)));
   } catch {
     // Ignore storage failures.
   }
@@ -217,11 +248,31 @@ function CollapsedSidebarControl({ showChevron, onShowBookmarks, onShowHistory }
   );
 }
 
-function SavedPlacesPanel({ title, items, emptyLabel, onSelect }) {
+function SavedPlacesPanel({
+  title,
+  items,
+  emptyLabel,
+  onSelect,
+  onClear,
+  clearLabel,
+}) {
   return (
     <div className="space-y-4">
-      <div className="text-xs font-semibold uppercase tracking-[0.25em] text-muted-foreground">
-        {title}
+      <div className="flex items-center justify-between gap-3">
+        <div className="text-xs font-semibold uppercase tracking-[0.25em] text-muted-foreground">
+          {title}
+        </div>
+        {onClear && items.length > 0 ? (
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="h-7 px-2 text-[11px] uppercase tracking-[0.2em]"
+            onClick={onClear}
+          >
+            {clearLabel || "Clear"}
+          </Button>
+        ) : null}
       </div>
       {items.length === 0 ? (
         <div className="text-sm text-muted-foreground">{emptyLabel}</div>
@@ -232,6 +283,10 @@ function SavedPlacesPanel({ title, items, emptyLabel, onSelect }) {
               stripCitationMarkers(stripMarkdown(item.summary || "")),
               SUMMARY_SNIPPET_LENGTH,
             );
+            const imageSrc =
+              item.image ||
+              (Array.isArray(item.images) ? item.images[0] : "") ||
+              "";
             return (
               <button
                 key={item.id}
@@ -247,9 +302,9 @@ function SavedPlacesPanel({ title, items, emptyLabel, onSelect }) {
                     {formatCoord(item.lat)}, {formatCoord(item.lng)}
                   </div>
                 </div>
-                {item.image ? (
+                {imageSrc ? (
                   <img
-                    src={item.image}
+                    src={imageSrc}
                     alt={item.title}
                     loading="lazy"
                     className="h-40 w-full rounded-md object-cover"
@@ -417,6 +472,9 @@ export default function App() {
   const [selectedInterests, setSelectedInterests] = useState([]);
   const [showExplorePills, setShowExplorePills] = useState(false);
   const [showMorePlacesButton, setShowMorePlacesButton] = useState(true);
+  const [hidePlacesPills, setHidePlacesPills] = useState(() =>
+    loadStoredFlag(PLACES_PILLS_STORAGE_KEY),
+  );
   const [exploreOpen, setExploreOpen] = useState(true);
   const [placesScrollState, setPlacesScrollState] = useState({});
   const [summaryOpen, setSummaryOpen] = useState(true);
@@ -429,6 +487,7 @@ export default function App() {
   const [expandedOpen, setExpandedOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [sidebarMode, setSidebarMode] = useState<SidebarMode>("details");
+  const [isCachedView, setIsCachedView] = useState(false);
   const [bookmarks, setBookmarks] = useState<SavedPlace[]>(() =>
     loadStoredPlaces(BOOKMARKS_STORAGE_KEY),
   );
@@ -453,7 +512,6 @@ export default function App() {
   }, []);
   const selectLocationRef = useRef(null);
   const placesRowRefs = useRef({});
-  const lastStatusRef = useRef(status);
 
   useEffect(() => {
     saveStoredPlaces(BOOKMARKS_STORAGE_KEY, bookmarks);
@@ -462,6 +520,13 @@ export default function App() {
   useEffect(() => {
     saveStoredPlaces(HISTORY_STORAGE_KEY, history);
   }, [history]);
+
+  useEffect(() => {
+    saveStoredFlag(PLACES_PILLS_STORAGE_KEY, hidePlacesPills);
+    if (hidePlacesPills) {
+      setShowExplorePills(false);
+    }
+  }, [hidePlacesPills]);
 
   const abortRequests = useCallback(() => {
     if (aiAbortRef.current) {
@@ -614,6 +679,12 @@ export default function App() {
 
   const handleFetchPlaces = useCallback(() => {
     if (!coords || selectedInterests.length === 0) return;
+    if (isCachedView) {
+      setIsCachedView(false);
+    }
+    if (!hidePlacesPills) {
+      setHidePlacesPills(true);
+    }
     const selections = OPTIONAL_INTERESTS.filter((interest) =>
       selectedInterests.includes(interest.id),
     );
@@ -625,7 +696,13 @@ export default function App() {
     setShowExplorePills(false);
     setShowMorePlacesButton(false);
     runPlacesSearch({ lat: coords.lat, lng: coords.lng, interests, append: true });
-  }, [coords, runPlacesSearch, selectedInterests]);
+  }, [
+    coords,
+    hidePlacesPills,
+    isCachedView,
+    runPlacesSearch,
+    selectedInterests,
+  ]);
 
   useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
@@ -648,6 +725,12 @@ export default function App() {
       setExpandedOpen(false);
     }
   }, [isMobile, expandedOpen]);
+
+  useEffect(() => {
+    if (isMobile && sidebarMode !== "details") {
+      setSidebarMode("details");
+    }
+  }, [isMobile, sidebarMode]);
 
   useEffect(() => {
     if (!placesGroups.length) {
@@ -758,6 +841,7 @@ export default function App() {
 
     const handleSelectLocation = (lng, lat) => {
       abortRequests();
+      setIsCachedView(false);
       setSidebarOpen(true);
       setSidebarMode("details");
       const requestId = ++requestIdRef.current;
@@ -942,10 +1026,31 @@ export default function App() {
       lat: coords.lat,
       lng: coords.lng,
       summary: summaryText,
+      images: Array.isArray(images) ? images : [],
+      sources: Array.isArray(sources) ? sources : [],
+      placesGroups: Array.isArray(placesGroups) ? placesGroups : [],
+      placesError: placesError || "",
+      placesStatus: placesStatus,
+      weather: weather ?? null,
+      weatherStatus: weatherStatus,
+      weatherError: weatherError || "",
       image: images[0],
       savedAt: Date.now(),
     };
-  }, [coords, cleanedSummary, summary, displayPlaceName, images]);
+  }, [
+    coords,
+    cleanedSummary,
+    summary,
+    displayPlaceName,
+    images,
+    sources,
+    placesGroups,
+    placesError,
+    placesStatus,
+    weather,
+    weatherStatus,
+    weatherError,
+  ]);
 
   const isBookmarked = useMemo(() => {
     if (!currentPlaceId) return false;
@@ -1180,15 +1285,72 @@ export default function App() {
     setExpandedCarouselIndex((prev) => (prev - 1 + images.length) % images.length);
   };
 
-  const handleSelectSavedPlace = useCallback(
+  const focusMapAt = useCallback((lng, lat) => {
+    const map = mapRef.current;
+    const marker = markerRef.current;
+    if (!map || !marker) return;
+    marker.setLngLat([lng, lat]).addTo(map);
+    map.flyTo({
+      center: [lng, lat],
+      zoom: Math.max(map.getZoom(), 9),
+      duration: 900,
+    });
+  }, []);
+
+  const applyCachedPlace = useCallback(
     (place) => {
-      const selectLocation = selectLocationRef.current;
-      if (!selectLocation) return;
+      setIsCachedView(true);
       setSidebarMode("details");
       setSidebarOpen(true);
-      selectLocation(place.lng, place.lat);
+      setStatus("ready");
+      setCoords({ lng: place.lng, lat: place.lat });
+      setGeoStatus("ready");
+      setPlaceName(place.title || "Unknown location");
+      setSummary(place.summary || "");
+      setAiError("");
+      setImages(Array.isArray(place.images) ? place.images : []);
+      setSources(Array.isArray(place.sources) ? place.sources : []);
+      setPlacesGroups(Array.isArray(place.placesGroups) ? place.placesGroups : []);
+      setPlacesStatus(
+        place.placesStatus ||
+          (Array.isArray(place.placesGroups) && place.placesGroups.length > 0
+            ? "ready"
+            : "idle"),
+      );
+      setPlacesError(place.placesError || "");
+      setSelectedInterests([]);
+      setShowExplorePills(false);
+      setShowMorePlacesButton(true);
+      setExploreOpen(true);
+      setPlacesScrollState({});
+      setSummaryOpen(true);
+      setSourcesOpen(false);
+      setLightboxOpen(false);
+      setLightboxIndex(0);
+      setLightboxSource(null);
+      setSidebarCarouselIndex(0);
+      setExpandedCarouselIndex(0);
+      setExpandedOpen(false);
+      setWeather(place.weather ?? null);
+      setWeatherStatus(
+        place.weatherStatus || (place.weather ? "ready" : "idle"),
+      );
+      setWeatherError(place.weatherError || "");
+      setHistory((prev) => {
+        const nextEntry = { ...place, savedAt: Date.now() };
+        const next = [nextEntry, ...prev.filter((item) => item.id !== place.id)];
+        return next.slice(0, HISTORY_LIMIT);
+      });
+      focusMapAt(place.lng, place.lat);
     },
-    [setSidebarMode, setSidebarOpen],
+    [focusMapAt],
+  );
+
+  const handleSelectSavedPlace = useCallback(
+    (place) => {
+      applyCachedPlace(place);
+    },
+    [applyCachedPlace],
   );
 
   const handleBookmarkToggle = useCallback(() => {
@@ -1213,18 +1375,93 @@ export default function App() {
     setSidebarMode("history");
   }, []);
 
-  useEffect(() => {
-    if (status === "ready" && lastStatusRef.current !== "ready") {
+  const handleClearHistory = useCallback(() => {
+    setHistory([]);
+    setBookmarks([]);
+    saveStoredPlaces(HISTORY_STORAGE_KEY, []);
+    saveStoredPlaces(BOOKMARKS_STORAGE_KEY, []);
+  }, []);
+
+  const updateHistoryEntry = useCallback((entry) => {
+    setHistory((prev) => {
+      const next = [entry, ...prev.filter((item) => item.id !== entry.id)];
+      return next.slice(0, HISTORY_LIMIT);
+    });
+  }, []);
+
+  const updateBookmarkEntry = useCallback((entry) => {
+    setBookmarks((prev) =>
+      prev.map((item) =>
+        item.id === entry.id ? { ...item, ...entry, savedAt: item.savedAt } : item,
+      ),
+    );
+  }, []);
+
+  const handleRefreshWeather = useCallback(async () => {
+    if (!coords) return;
+    setWeatherStatus("loading");
+    setWeatherError("");
+    try {
+      const res = await fetch(`${apiBaseUrl}/weather`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ lat: coords.lat, lng: coords.lng }),
+      });
+      if (!res.ok) {
+        throw new Error(`Weather request failed (${res.status})`);
+      }
+      const data = await res.json();
+      setWeather(data);
+      setWeatherStatus("ready");
       const entry = buildSavedPlace();
       if (entry) {
-        setHistory((prev) => {
-          const next = [entry, ...prev.filter((item) => item.id !== entry.id)];
-          return next.slice(0, HISTORY_LIMIT);
-        });
+        const nextEntry = {
+          ...entry,
+          weather: data,
+          weatherStatus: "ready",
+          weatherError: "",
+        };
+        updateHistoryEntry(nextEntry);
+        if (isBookmarked) updateBookmarkEntry(nextEntry);
       }
+    } catch (err) {
+      setWeatherError(
+        err instanceof Error ? err.message : "Weather request failed.",
+      );
+      setWeatherStatus("error");
     }
-    lastStatusRef.current = status;
-  }, [status, buildSavedPlace]);
+  }, [
+    apiBaseUrl,
+    buildSavedPlace,
+    coords,
+    isBookmarked,
+    updateBookmarkEntry,
+    updateHistoryEntry,
+  ]);
+
+  useEffect(() => {
+    if (isCachedView) return;
+    if (!coords || status !== "ready") return;
+    const entry = buildSavedPlace();
+    if (!entry) return;
+    updateHistoryEntry(entry);
+    if (isBookmarked) updateBookmarkEntry(entry);
+  }, [
+    status,
+    placesStatus,
+    weatherStatus,
+    summary,
+    images,
+    sources,
+    placesGroups,
+    weather,
+    coords,
+    isCachedView,
+    isBookmarked,
+    buildSavedPlace,
+    updateBookmarkEntry,
+    updateHistoryEntry,
+  ]);
 
   const weatherLabel = useMemo(() => {
     if (weatherStatus === "loading") return "Weather...";
@@ -1408,6 +1645,21 @@ export default function App() {
               <WeatherIcon kind={weatherKind} />
             </span>
             <span>{weatherLabel}</span>
+            <Button
+              type="button"
+              size="icon-sm"
+              variant="ghost"
+              className="h-7 w-7"
+              onClick={handleRefreshWeather}
+              aria-label="Refresh weather"
+              disabled={weatherStatus === "loading"}
+            >
+              <RefreshCw
+                className={`h-3.5 w-3.5 ${
+                  weatherStatus === "loading" ? "animate-spin" : ""
+                }`}
+              />
+            </Button>
           </span>
         </div>
       </div>
@@ -1458,7 +1710,10 @@ export default function App() {
       </div>
     );
     const showStatusStack =
-      !isMobile && statusItems.some((item) => item.status !== "ready");
+      !isMobile &&
+      (status === "loading" ||
+        aiStatus === "loading" ||
+        placesStatus === "loading");
 
     const showSummaryBlock = isMobile || aiStatus !== "loading";
     const showPlacesLoadingSkeletons =
@@ -1471,9 +1726,11 @@ export default function App() {
         placesStatus === "error" ||
         showPlacesLoadingSkeletons);
     const showEmptyPlacesState = placesEmpty;
-    const showEmptyPlacesCta = showEmptyPlacesState && !showExplorePills;
+    const showEmptyPlacesCta =
+      showEmptyPlacesState && !showExplorePills && !hidePlacesPills;
     const showPlacesErrorState = placesErrorEmpty;
-    const showPlacesErrorCta = showPlacesErrorState && !showExplorePills;
+    const showPlacesErrorCta =
+      showPlacesErrorState && !showExplorePills && !hidePlacesPills;
 
     const imagesBlock =
       images.length > 0 ? (
@@ -1916,7 +2173,10 @@ export default function App() {
                 ))}
               </div>
             )}
-            {showMorePlacesButton && !showExplorePills && !showEmptyPlacesState && (
+            {showMorePlacesButton &&
+              !showExplorePills &&
+              !showEmptyPlacesState &&
+              !hidePlacesPills && (
               <div className="flex items-center gap-3">
                 <Button
                   type="button"
@@ -1932,7 +2192,7 @@ export default function App() {
                 </span>
               </div>
             )}
-            {showExplorePills && (
+            {showExplorePills && !hidePlacesPills && (
               <div className="space-y-2">
                 <div className="flex flex-wrap gap-2">
                   {OPTIONAL_INTERESTS.map((interest) => {
@@ -2072,24 +2332,29 @@ export default function App() {
     />
   );
 
-  const sidebarBody =
-    sidebarMode === "details" ? (
-      sidebarDetails
-    ) : sidebarMode === "bookmarks" ? (
-      <SavedPlacesPanel
-        title="Bookmarks"
-        items={bookmarks}
-        emptyLabel="No bookmarks yet."
-        onSelect={handleSelectSavedPlace}
-      />
-    ) : (
-      <SavedPlacesPanel
-        title="Recently visited"
-        items={history}
-        emptyLabel="No places visited yet."
-        onSelect={handleSelectSavedPlace}
-      />
-    );
+  const sidebarBody = isMobile
+    ? sidebarDetails
+    : sidebarMode === "details"
+      ? sidebarDetails
+      : sidebarMode === "bookmarks"
+        ? (
+            <SavedPlacesPanel
+              title="Bookmarks"
+              items={bookmarks}
+              emptyLabel="No bookmarks yet."
+              onSelect={handleSelectSavedPlace}
+            />
+          )
+        : (
+            <SavedPlacesPanel
+              title="Recently visited"
+              items={history}
+              emptyLabel="No places visited yet."
+              onSelect={handleSelectSavedPlace}
+              onClear={handleClearHistory}
+              clearLabel="Clear history"
+            />
+          );
 
   const expandedDetails = renderDetails({
     variant: "expanded",
@@ -2131,7 +2396,7 @@ export default function App() {
                         Geoplexer
                       </div>
                       <div className="flex items-center gap-2">
-                        {coords && (
+                        {coords && sidebarMode === "details" && !isMobile && (
                           <>
                             <Button
                               size="icon"
@@ -2174,11 +2439,13 @@ export default function App() {
               <SidebarContent className="px-4 group-data-[state=collapsed]:hidden">
                 {sidebarBody}
               </SidebarContent>
-            <CollapsedSidebarControl
-              showChevron={status !== "idle"}
-              onShowBookmarks={handleOpenBookmarks}
-              onShowHistory={handleOpenHistory}
-            />
+            {!isMobile && (
+              <CollapsedSidebarControl
+                showChevron={status !== "idle"}
+                onShowBookmarks={handleOpenBookmarks}
+                onShowHistory={handleOpenHistory}
+              />
+            )}
           </div>
         </Sidebar>
       )}
@@ -2192,7 +2459,22 @@ export default function App() {
               className="relative w-full max-w-6xl rounded-lg border border-border bg-sidebar/90 p-8 shadow-xl backdrop-blur-xl"
               onClick={(event) => event.stopPropagation()}
             >
-              <div className="mb-2 -mt-4 -mr-4 flex items-center justify-end">
+              <div className="mb-2 -mt-4 -mr-4 flex items-center justify-end gap-2">
+                {coords && (
+                  <button
+                    type="button"
+                    className="flex h-9 w-9 items-center justify-center rounded-full border border-border bg-background/80 text-foreground shadow-sm backdrop-blur"
+                    onClick={handleBookmarkToggle}
+                    aria-label="Bookmark"
+                  >
+                    <Bookmark
+                      className={`h-4 w-4 ${
+                        isBookmarked ? "text-cyan-300" : "text-foreground"
+                      }`}
+                      fill={isBookmarked ? "currentColor" : "none"}
+                    />
+                  </button>
+                )}
                 <button
                   type="button"
                   className="flex h-9 w-9 items-center justify-center rounded-full border border-border bg-background/80 text-foreground shadow-sm backdrop-blur"

@@ -1,3 +1,5 @@
+import Perplexity from "@perplexity-ai/perplexity_ai";
+
 export interface AiResponse {
   summary: string;
   facts: string[];
@@ -6,17 +8,26 @@ export interface AiResponse {
   sources: string[];
 }
 
-const PPLX_API_URL =
-  process.env.PERPLEXITY_API_URL ||
-  "https://api.perplexity.ai/chat/completions";
+const PPLX_BASE_URL = normalizeBaseUrl(
+  process.env.PERPLEXITY_BASE_URL ?? process.env.PERPLEXITY_API_URL,
+);
 const PPLX_API_KEY = process.env.PERPLEXITY_API_KEY;
 const PPLX_MODEL = process.env.PERPLEXITY_MODEL || "sonar-reasoning-pro";
 const PPLX_TIMEOUT_MS = Number(process.env.PERPLEXITY_TIMEOUT_MS ?? 25000);
 const PPLX_MAX_RETRIES = 1;
 const PPLX_MAX_TOKENS = Number(process.env.PERPLEXITY_MAX_TOKENS ?? 2000);
 
+const PPLX_CLIENT = PPLX_API_KEY
+  ? new Perplexity({
+      apiKey: PPLX_API_KEY,
+      baseURL: PPLX_BASE_URL ?? undefined,
+      timeout: PPLX_TIMEOUT_MS,
+      maxRetries: PPLX_MAX_RETRIES,
+    })
+  : null;
+
 type PplxMessage = {
-  content?: string;
+  content?: string | unknown[];
   citations?: unknown[];
   images?: unknown[];
 };
@@ -26,6 +37,38 @@ type PplxResponse = {
   citations?: unknown[];
   images?: unknown[];
 };
+
+function normalizeBaseUrl(raw?: string) {
+  if (!raw) return undefined;
+  try {
+    const url = new URL(raw);
+    const cleanedPath = url.pathname.replace(/\/chat\/completions\/?$/, "");
+    url.pathname = cleanedPath || "/";
+    url.search = "";
+    url.hash = "";
+    if (!url.pathname || url.pathname === "/") {
+      return url.origin;
+    }
+    return `${url.origin}${url.pathname}`;
+  } catch {
+    return raw;
+  }
+}
+
+function extractTextContent(input: unknown) {
+  if (typeof input === "string") return input;
+  if (Array.isArray(input)) {
+    const textParts = input
+      .map((part) => {
+        if (!part || typeof part !== "object") return null;
+        const record = part as { text?: unknown };
+        return typeof record.text === "string" ? record.text : null;
+      })
+      .filter((value): value is string => Boolean(value));
+    if (textParts.length > 0) return textParts.join("");
+  }
+  return "";
+}
 
 function stripCodeFence(input: string) {
   let jsonStr = input.trim();
@@ -52,7 +95,7 @@ function stripThinkContent(input: string) {
 }
 
 function extractValidJson(response: PplxResponse) {
-  const content = response.choices?.[0]?.message?.content ?? "";
+  const content = extractTextContent(response.choices?.[0]?.message?.content);
   if (!content) return null;
   const marker = "</think>";
   const idx = content.lastIndexOf(marker);
@@ -105,7 +148,7 @@ async function callPerplexity(
   systemPrompt: string,
   userPrompt: string,
 ): Promise<AiResponse> {
-  if (!PPLX_API_KEY) {
+  if (!PPLX_API_KEY || !PPLX_CLIENT) {
     return {
       summary: "AI is not configured yet.",
       facts: [],
@@ -115,57 +158,21 @@ async function callPerplexity(
     } satisfies AiResponse;
   }
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), PPLX_TIMEOUT_MS);
-
   try {
-    const requestOnce = async () => {
-      const res = await fetch(PPLX_API_URL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${PPLX_API_KEY}`,
-        },
-        body: JSON.stringify({
-          model: PPLX_MODEL,
-          return_images: true,
-          max_tokens: PPLX_MAX_TOKENS,
-          messages: [
-            { role: "system", content: systemPrompt },
-            { role: "user", content: userPrompt },
-          ],
-          temperature: 0.3,
-        }),
-        signal: controller.signal,
-      });
-
-      if (!res.ok) {
-        throw new Error(`AI error ${res.status}`);
-      }
-
-      return (await res.json()) as PplxResponse;
-    };
-
-    let data: PplxResponse | null = null;
-    for (let attempt = 0; attempt <= PPLX_MAX_RETRIES; attempt += 1) {
-      try {
-        data = await requestOnce();
-        break;
-      } catch (error) {
-        const isAbort =
-          error instanceof Error &&
-          (error.name === "AbortError" ||
-            error.message.toLowerCase().includes("aborted"));
-        if (!isAbort || attempt === PPLX_MAX_RETRIES) throw error;
-      }
-    }
-
-    if (!data) {
-      throw new Error(`AI request timed out after ${PPLX_TIMEOUT_MS}ms`);
-    }
+    const data = (await PPLX_CLIENT.chat.completions.create({
+      model: PPLX_MODEL,
+      return_images: true,
+      max_tokens: PPLX_MAX_TOKENS,
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      temperature: 0.3,
+    })) as PplxResponse;
 
     const rawText =
-      data.choices?.[0]?.message?.content ?? "No AI response available.";
+      extractTextContent(data.choices?.[0]?.message?.content) ||
+      "No AI response available.";
     const text = stripThinkContent(rawText);
     const parsed = extractValidJson(data);
     const summary =
@@ -197,8 +204,6 @@ async function callPerplexity(
       images: [],
       sources: [],
     } satisfies AiResponse;
-  } finally {
-    clearTimeout(timeout);
   }
 }
 

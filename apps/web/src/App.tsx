@@ -44,6 +44,7 @@ type SavedPlace = {
   weatherStatus?: string;
   weatherError?: string;
   image?: string;
+  submittedInterests?: string[];
   savedAt: number;
 };
 
@@ -53,7 +54,8 @@ const BOOKMARKS_STORAGE_KEY = "geoplexer.bookmarks";
 const HISTORY_STORAGE_KEY = "geoplexer.history";
 const PLACE_CACHE_RADIUS_METERS = 1000;
 const PLACE_NAME_RADIUS_METERS = 10_000;
-const HISTORY_LIMIT = 40;
+const HISTORY_LIMIT = 200;
+const SAVED_PLACES_PAGE_SIZE = 40;
 const SUMMARY_SNIPPET_LENGTH = 220;
 
 const buildPlaceId = (lat, lng) => `${lat.toFixed(4)},${lng.toFixed(4)}`;
@@ -109,7 +111,7 @@ const normalizePlaceKey = (value) =>
     ? value.trim().toLowerCase().replace(/\s+/g, " ")
     : "";
 
-const normalizeGroupKey = (value) =>
+const normalizeInterestId = (value) =>
   typeof value === "string"
     ? value.trim().toLowerCase().replace(/\s+/g, " ")
     : "";
@@ -117,6 +119,18 @@ const normalizeGroupKey = (value) =>
 const getPlaceNameKey = (place) => {
   if (!place || typeof place !== "object") return "";
   return normalizePlaceKey(place.title) || normalizePlaceKey(place.id) || "";
+};
+
+const mergeInterestIds = (...lists) => {
+  const set = new Set();
+  lists.forEach((list) => {
+    if (!Array.isArray(list)) return;
+    list.forEach((value) => {
+      const key = normalizeInterestId(value);
+      if (key) set.add(key);
+    });
+  });
+  return Array.from(set);
 };
 
 const distanceMeters = (a, b) => {
@@ -167,11 +181,24 @@ const isSamePlaceForCache = (a, b) => isSamePlaceByRadius(a, b);
 const dedupePlaces = (places) => {
   const next = [];
   places.forEach((place) => {
-    const hasDuplicate = next.some((existing) =>
+    const index = next.findIndex((existing) =>
       isSamePlaceForLists(existing, place),
     );
-    if (hasDuplicate) return;
-    next.push(place);
+    if (index === -1) {
+      next.push(place);
+      return;
+    }
+    const existing = next[index];
+    const merged = {
+      ...existing,
+      ...place,
+      submittedInterests: mergeInterestIds(
+        existing?.submittedInterests,
+        place?.submittedInterests,
+      ),
+      savedAt: Math.max(existing?.savedAt ?? 0, place?.savedAt ?? 0),
+    };
+    next[index] = merged;
   });
   return next;
 };
@@ -308,7 +335,27 @@ function SavedPlacesPanel({
   onSelect,
   onClear,
   clearLabel,
+  pageSize = 40,
+  enableLoadMore = false,
 }) {
+  const [visibleCount, setVisibleCount] = useState(pageSize);
+
+  useEffect(() => {
+    setVisibleCount(pageSize);
+  }, [pageSize, title]);
+
+  useEffect(() => {
+    if (!enableLoadMore) return;
+    if (visibleCount > items.length) {
+      setVisibleCount(items.length);
+    }
+  }, [enableLoadMore, items.length, visibleCount]);
+
+  const visibleItems = enableLoadMore
+    ? items.slice(0, visibleCount)
+    : items;
+  const canLoadMore = enableLoadMore && visibleCount < items.length;
+
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between gap-3">
@@ -331,7 +378,7 @@ function SavedPlacesPanel({
         <div className="text-sm text-muted-foreground">{emptyLabel}</div>
       ) : (
         <div className="space-y-4">
-          {items.map((item) => {
+          {visibleItems.map((item) => {
             const summaryText = truncateText(
               stripCitationMarkers(stripMarkdown(item.summary || "")),
               SUMMARY_SNIPPET_LENGTH,
@@ -375,6 +422,20 @@ function SavedPlacesPanel({
               </button>
             );
           })}
+          {canLoadMore && (
+            <Button
+              type="button"
+              variant="ghost"
+              className="h-9 w-full text-xs uppercase tracking-[0.22em]"
+              onClick={() =>
+                setVisibleCount((prev) =>
+                  Math.min(prev + pageSize, items.length),
+                )
+              }
+            >
+              Load more
+            </Button>
+          )}
         </div>
       )}
     </div>
@@ -525,6 +586,7 @@ export default function App() {
   const [placesStatus, setPlacesStatus] = useState("idle");
   const [placesError, setPlacesError] = useState("");
   const [selectedInterests, setSelectedInterests] = useState([]);
+  const [submittedInterests, setSubmittedInterests] = useState<string[]>([]);
   const [exploreModalOpen, setExploreModalOpen] = useState(false);
   const [exploreOpen, setExploreOpen] = useState(true);
   const [placesScrollState, setPlacesScrollState] = useState({});
@@ -646,6 +708,7 @@ export default function App() {
     setPlacesStatus("idle");
     setPlacesError("");
     setSelectedInterests([]);
+    setSubmittedInterests([]);
     setExploreModalOpen(false);
     setExploreOpen(true);
     setPlacesScrollState({});
@@ -778,28 +841,18 @@ export default function App() {
     return "Open ocean";
   }, [coords, geoStatus, placeName]);
 
-  const optionalInterestsForModal = useMemo(() => {
-    const keys = new Set();
-    placesGroups.forEach((group) => {
-      if (!group || typeof group !== "object") return;
-      if (group.id) keys.add(normalizeGroupKey(group.id));
-      if (group.label) keys.add(normalizeGroupKey(group.label));
-      if (group.query) keys.add(normalizeGroupKey(group.query));
-      if (group.name) keys.add(normalizeGroupKey(group.name));
-      if (group.title) keys.add(normalizeGroupKey(group.title));
-      if (group.category) keys.add(normalizeGroupKey(group.category));
-    });
-    return OPTIONAL_INTERESTS.filter((interest) => {
-      const idKey = normalizeGroupKey(interest.id);
-      const labelKey = normalizeGroupKey(interest.label);
-      const queryKey = normalizeGroupKey(interest.query);
-      return (
-        !keys.has(idKey) &&
-        !keys.has(labelKey) &&
-        !keys.has(queryKey)
-      );
-    });
-  }, [placesGroups]);
+  const remainingOptionalInterests = useMemo(() => {
+    const submittedSet = new Set(
+      (Array.isArray(submittedInterests) ? submittedInterests : []).map(
+        normalizeInterestId,
+      ),
+    );
+    return OPTIONAL_INTERESTS.filter(
+      (interest) => !submittedSet.has(normalizeInterestId(interest.id)),
+    );
+  }, [submittedInterests]);
+
+  const canRefinePlaces = remainingOptionalInterests.length > 0;
 
   const toggleInterest = useCallback((interestId) => {
     placesRequestIdRef.current += 1;
@@ -976,6 +1029,7 @@ export default function App() {
       setPlacesStatus("idle");
       setPlacesError("");
       setSelectedInterests([]);
+      setSubmittedInterests([]);
       setExploreModalOpen(false);
       setExploreOpen(true);
       setPlacesScrollState({});
@@ -1134,6 +1188,9 @@ export default function App() {
       weatherStatus: weatherStatus,
       weatherError: weatherError || "",
       image: images[0],
+      submittedInterests: Array.isArray(submittedInterests)
+        ? submittedInterests
+        : [],
       savedAt: Date.now(),
     };
   }, [
@@ -1149,6 +1206,7 @@ export default function App() {
     weather,
     weatherStatus,
     weatherError,
+    submittedInterests,
   ]);
 
   const isBookmarked = useMemo(() => {
@@ -1420,6 +1478,9 @@ export default function App() {
       );
       setPlacesError(place.placesError || "");
       setSelectedInterests([]);
+      setSubmittedInterests(
+        Array.isArray(place.submittedInterests) ? place.submittedInterests : [],
+      );
       setExploreModalOpen(false);
       setExploreOpen(true);
       setPlacesScrollState({});
@@ -1438,10 +1499,15 @@ export default function App() {
       setWeatherError(place.weatherError || "");
       setHistory((prev) => {
         const existing = prev.find((item) => isSamePlaceForLists(item, place));
+        const mergedInterests = mergeInterestIds(
+          existing?.submittedInterests,
+          place.submittedInterests,
+        );
         const nextEntry = {
           ...(existing || {}),
           ...place,
           savedAt: Date.now(),
+          submittedInterests: mergedInterests,
         };
         const next = [
           nextEntry,
@@ -1502,9 +1568,14 @@ export default function App() {
     if (!entry) return;
     setHistory((prev) => {
       const existing = prev.find((item) => isSamePlaceForLists(item, entry));
+      const mergedInterests = mergeInterestIds(
+        existing?.submittedInterests,
+        entry.submittedInterests,
+      );
       const merged = {
         ...(existing || {}),
         ...entry,
+        submittedInterests: mergedInterests,
       };
       const next = [
         merged,
@@ -1525,6 +1596,10 @@ export default function App() {
             ...item,
             ...entry,
             savedAt: item.savedAt,
+            submittedInterests: mergeInterestIds(
+              item.submittedInterests,
+              entry.submittedInterests,
+            ),
           };
         }
         return item;
@@ -1541,6 +1616,11 @@ export default function App() {
     const selections = OPTIONAL_INTERESTS.filter((interest) =>
       selectedInterests.includes(interest.id),
     );
+    const nextSubmitted = mergeInterestIds(
+      submittedInterests,
+      selections.map((interest) => interest.id),
+    );
+    setSubmittedInterests(nextSubmitted);
     const interests = selections.map(({ id, label, query }) => ({
       id,
       label,
@@ -1548,14 +1628,33 @@ export default function App() {
     }));
     setExploreModalOpen(false);
     runPlacesSearch({ lat: coords.lat, lng: coords.lng, interests, append: true });
-  }, [coords, isCachedView, runPlacesSearch, selectedInterests]);
+    const entry = buildSavedPlace();
+    if (entry) {
+      const nextEntry = { ...entry, submittedInterests: nextSubmitted };
+      updateHistoryEntry(nextEntry);
+      if (isBookmarked) {
+        updateBookmarkEntry(nextEntry);
+      }
+    }
+  }, [
+    coords,
+    isBookmarked,
+    isCachedView,
+    buildSavedPlace,
+    runPlacesSearch,
+    selectedInterests,
+    submittedInterests,
+    updateBookmarkEntry,
+    updateHistoryEntry,
+  ]);
 
   const handleResetExplore = useCallback(() => {
+    if (!canRefinePlaces) return;
     setSelectedInterests([]);
     setExploreModalOpen(true);
     setPlacesError("");
     setPlacesScrollState({});
-  }, []);
+  }, [canRefinePlaces]);
 
   const handleRefreshWeather = useCallback(async () => {
     if (!coords) return;
@@ -2307,17 +2406,19 @@ export default function App() {
                 ))}
               </div>
             )}
-            <div className="flex items-center gap-2">
-              <Button
-                type="button"
-                size="sm"
-                variant="outline"
-                className="h-8 px-3 text-xs"
-                onClick={handleResetExplore}
-              >
-                Refine places
-              </Button>
-            </div>
+            {canRefinePlaces && (
+              <div className="flex items-center gap-2">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  className="h-8 px-3 text-xs"
+                  onClick={handleResetExplore}
+                >
+                  Refine places
+                </Button>
+              </div>
+            )}
           </>
         )}
       </div>
@@ -2428,6 +2529,8 @@ export default function App() {
               items={bookmarks}
               emptyLabel="No bookmarks yet."
               onSelect={handleSelectSavedPlace}
+              pageSize={SAVED_PLACES_PAGE_SIZE}
+              enableLoadMore
             />
           )
         : (
@@ -2438,6 +2541,8 @@ export default function App() {
               onSelect={handleSelectSavedPlace}
               onClear={handleClearHistory}
               clearLabel="Clear history"
+              pageSize={SAVED_PLACES_PAGE_SIZE}
+              enableLoadMore
             />
           );
 
@@ -2613,7 +2718,7 @@ export default function App() {
                 </Button>
               </div>
               <div className="mt-4 flex flex-wrap gap-2">
-                {optionalInterestsForModal.map((interest) => {
+                {remainingOptionalInterests.map((interest) => {
                   const isActive = selectedInterests.includes(interest.id);
                   return (
                     <button
